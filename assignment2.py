@@ -26,14 +26,16 @@ config = {
     'hdfs_dev_data_path': 'hdfs:///user/dic25_shared/amazon-reviews/full/reviews_devset.json',
     'hdfs_full_data_path': 'hdfs:///user/dic25_shared/amazon-reviews/full/reviewscombined.json',
     # Output paths
-    'local_output_path': './output/output.txt',
-    'hdfs_output_dir': 'hdfs:///user/dic25_shared/output/assignment1',
+    'local_task1_output_path': './output/output_rdd.txt',
+    'local_task2_output_path': './output/output_ds.txt',
+    'hdfs_output_dir': 'hdfs:///user/dic25_shared/output/assignment2',
     # Spark config
     'spark_master': 'local[*]',  # ignored in cluster mode
-    'spark_app_name': 'Assignment1_ChiSquare',
+    'spark_app_name': 'Assignment2_ChiSquare',
     # Chi-square and output params
     'top_terms_per_category': 75,
-    'random_seed': 42
+    'random_seed': 42,
+    'num_features': 2000,
 }
 
 # -------------------------------
@@ -191,8 +193,8 @@ output_lines_rdd = (
 )
 
 if config['mode'] == 'local':
-    os.makedirs(os.path.dirname(config['local_output_path']), exist_ok=True)
-    with open(config['local_output_path'], 'w') as out:
+    os.makedirs(os.path.dirname(config['local_task1_output_path']), exist_ok=True)
+    with open(config['local_task1_output_path'], 'w') as out:
         for line in output_lines_rdd.collect():
             out.write(line + "\n")
         out.write(merged_dict_line + "\n")
@@ -203,7 +205,7 @@ else:
 
 #######################################################################################################################################################################################################################
 
-"""# Part 2: DataFrame-based Text Processing Pipeline
+# Part 2: DataFrame-based Text Processing Pipeline
 print("\nPart 2: DataFrame-based Text Processing Pipeline")
 reviews_df = spark.read.json(data_path)
 
@@ -259,10 +261,12 @@ sorted_tokens = sorted(list(all_tokens))
 selected_terms = [sorted_tokens[i] for i in selected_features]
 
 # Write the selected terms to output file
-with open(os.path.join(output_dir, 'output_ds.txt'), 'w') as f:
+with open(config['local_task2_output_path'], 'w') as f:
     f.write(" ".join(sorted(selected_terms)) + "\n")
 
-# Part 3: Text Classification using SVM
+###################################################################################################################################################################################################
+
+"""# Part 3: Text Classification using SVM
 print("\nPart 3: Text Classification using SVM")
 
 # Split the data into training, validation, and test sets
