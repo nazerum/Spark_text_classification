@@ -1,0 +1,8 @@
+{
+    "name": "Local Spark",
+    "build": {
+      "dockerfile": "Dockerfile",
+      "context": ".."
+    },
+    "postCreateCommand": "pip install pyspark==3.5.0"
+}
