@@ -5,7 +5,7 @@ import json
 import re
 import os
 
-# (Keeping ML, numpy, plotting imports for later use)
+
 from pyspark.ml.feature import *
 from pyspark.ml.classification import *
 from pyspark.ml.evaluation import *
@@ -73,6 +73,8 @@ def parse_review(line):
 # -------------------------------
 # RDD-based Processing
 # -------------------------------
+print("\nPart 1: RDD-based Processing")
+
 # 1) Read data
 data_path = config['local_data_path'] if config['mode'] == 'local' else config['hdfs_dev_data_path']
 reviews_rdd = sc.textFile(data_path)
@@ -205,64 +207,78 @@ else:
 
 #######################################################################################################################################################################################################################
 
-# Part 2: DataFrame-based Text Processing Pipeline
-print("\nPart 2: DataFrame-based Text Processing Pipeline")
+# -------------------------------
+# Part 2: DataFrame-based Text Processing and Chi-Square Scoring
+# -------------------------------
+from pyspark.ml.feature import RegexTokenizer, StopWordsRemover, CountVectorizer, IDF, StringIndexer
+from pyspark.ml.stat import ChiSquareTest
+from pyspark.ml import Pipeline
+
+print("\nPart 2: DataFrame-based Text Processing and Chi-Square Scoring")
+
 reviews_df = spark.read.json(data_path)
 
-# Create the text processing pipeline
-tokenizer = Tokenizer(inputCol="reviewText", outputCol="tokens")
-stopwords_remover = StopWordsRemover(
+# Build pipeline
+tokenizer = RegexTokenizer(
+    inputCol="reviewText",
+    outputCol="tokens",
+    pattern=r"[\s\t\d()\[\]{}.!?,;:+=\-_'`~#@&*%€$§\\/]+",
+    toLowercase=True,
+    minTokenLength=2
+)
+
+#remove stopwords   
+remover = StopWordsRemover(
     inputCol="tokens",
     outputCol="filtered_tokens",
     stopWords=list(stopwords)
 )
-hashing_tf = HashingTF(
+
+#count vectorizer
+cv = CountVectorizer(
     inputCol="filtered_tokens",
     outputCol="raw_features",
-    numFeatures=config['num_features']
+    vocabSize=config['num_features'],
+    minDF=2
 )
+
+#idf
 idf = IDF(inputCol="raw_features", outputCol="features")
-# Convert category from string to numeric
-category_indexer = StringIndexer(inputCol="category", outputCol="categoryIndex")
-chi_sq_selector = ChiSqSelector(
-    numTopFeatures=config['num_features'],
-    featuresCol="features",
-    outputCol="selected_features",
-    labelCol="categoryIndex"
-)
 
-# Create the pipeline
-pipeline = Pipeline(stages=[
-    tokenizer,
-    stopwords_remover,
-    hashing_tf,
-    idf,
-    category_indexer,
-    chi_sq_selector
-])
+#indexer
+indexer = StringIndexer(inputCol="category", outputCol="categoryIndex")
 
-# Fit the pipeline
+#pipeline
+pipeline = Pipeline(stages=[tokenizer, remover, cv, idf, indexer])
 model = pipeline.fit(reviews_df)
+transformed = model.transform(reviews_df)
 
-# Transform the data
-transformed_df = model.transform(reviews_df)
+# Chi-Square test over all features
+chi2_result = ChiSquareTest.test(
+    transformed,
+    featuresCol="features",
+    labelCol="categoryIndex"
+).head()
+stats = chi2_result.statistics
+stats_array = stats.toArray() if hasattr(stats, "toArray") else stats
 
-# Get the selected features
-selected_features = model.stages[-1].selectedFeatures
+# Map indices to (term, chi2) and pick top K
+vocab = model.stages[2].vocabulary
+indexed = list(enumerate(stats_array))
+topk = sorted(indexed, key=lambda x: x[1], reverse=True)[:config['num_features']]
+selected = [(vocab[i], stats_array[i]) for i, _ in topk]
 
-# Get the tokens from the transformed data
-tokens_df = transformed_df.select("filtered_tokens").collect()
-all_tokens = set()
-for row in tokens_df:
-    all_tokens.update(row.filtered_tokens)
+# Write out tokens and chi2 scores in descending chi2 order
+if config['mode'] == 'local':
+    os.makedirs(os.path.dirname(config['local_task2_output_path']), exist_ok=True)
+    with open(config['local_task2_output_path'], 'w') as f:
+        for term, score in selected:
+            f.write(f"{term}\t{score:.6f}\n")
+else:
+    sc.parallelize([f"{term}\t{score:.6f}" for term, score in selected]) \
+      .saveAsTextFile(config['hdfs_ds_output_dir'])
 
-# Sort the tokens and select the ones corresponding to the selected features
-sorted_tokens = sorted(list(all_tokens))
-selected_terms = [sorted_tokens[i] for i in selected_features]
-
-# Write the selected terms to output file
-with open(config['local_task2_output_path'], 'w') as f:
-    f.write(" ".join(sorted(selected_terms)) + "\n")
+spark.stop()
 
 ###################################################################################################################################################################################################
 
