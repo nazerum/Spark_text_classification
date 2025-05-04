@@ -38,6 +38,17 @@ config = {
     'num_features': 2000,
 }
 
+config.update({
+    'train_ratio': 0.8,
+    'val_ratio':   0.1,
+    'test_ratio':  0.1,
+    'num_folds':   5,
+    # where to save your model locally
+    'local_model_output_path': './output/model'
+})
+
+
+
 # -------------------------------
 # Initialize Spark
 # -------------------------------
@@ -70,8 +81,9 @@ def parse_review(line):
     except Exception:
         return None
 
+'''
 # -------------------------------
-# RDD-based Processing
+# Part 1RDD-based Processing
 # -------------------------------
 print("\nPart 1: RDD-based Processing")
 
@@ -278,44 +290,67 @@ else:
     sc.parallelize([f"{term}\t{score:.6f}" for term, score in selected]) \
       .saveAsTextFile(config['hdfs_ds_output_dir'])
 
-spark.stop()
+#spark.stop()'''
 
 ###################################################################################################################################################################################################
 
-"""# Part 3: Text Classification using SVM
+from pyspark.ml.feature import ChiSqSelector
+from pyspark.ml.classification import LinearSVC, OneVsRest
+
+# temp
+data_path = config['local_data_path'] if config['mode'] == 'local' else config['hdfs_dev_data_path']
+reviews_df = spark.read.json(data_path)
+
+
+# Part 3: Text Classification using SVM
 print("\nPart 3: Text Classification using SVM")
 
-# Split the data into training, validation, and test sets
+# 1) Split
 train_df, val_df, test_df = reviews_df.randomSplit(
-    [config['train_ratio'], config['val_ratio'], config['test_ratio']], 
+    [config['train_ratio'],
+     config['val_ratio'],
+     config['test_ratio']],
     seed=config['random_seed']
 )
 
-# Create the text processing and classification pipeline
+print("Train count:", train_df.count())
+print("Val count:", val_df.count())
+print("Test count:", test_df.count())
+
+# 2) Build pipeline with SVM + Chi-Square selector
 tokenizer = Tokenizer(inputCol="reviewText", outputCol="tokens")
 stopwords_remover = StopWordsRemover(
-    inputCol="tokens",
-    outputCol="filtered_tokens",
-    stopWords=list(stopwords)
+    inputCol="tokens", outputCol="filtered_tokens", stopWords=list(stopwords)
 )
 hashing_tf = HashingTF(
-    inputCol="filtered_tokens",
-    outputCol="raw_features",
+    inputCol="filtered_tokens", outputCol="raw_features",
     numFeatures=config['num_features']
 )
-idf = IDF(inputCol="raw_features", outputCol="features")
+idf        = IDF(inputCol="raw_features", outputCol="features")
 normalizer = Normalizer(inputCol="features", outputCol="normalized_features", p=2.0)
-# Convert category from string to numeric
-category_indexer = StringIndexer(inputCol="category", outputCol="categoryIndex")
-# Use LogisticRegression instead of LinearSVC for multi-class classification
-lr = LogisticRegression(
-    featuresCol="normalized_features",
-    labelCol="categoryIndex",
-    predictionCol="prediction",
-    family="multinomial"
+category_indexer = StringIndexer(
+    inputCol="category", outputCol="categoryIndex"
 )
 
-# Create the pipeline
+# Chi-square selector stage
+chi_selector = ChiSqSelector(
+    numTopFeatures=2000,  
+    featuresCol="raw_features",  
+    outputCol="selected_features",
+    labelCol="categoryIndex"
+)
+
+# SVM wrapped in one-vs-rest for multi-class
+lsvc = LinearSVC(
+    featuresCol="selected_features",
+    labelCol="categoryIndex"
+)
+ovr = OneVsRest(
+    classifier=lsvc,
+    labelCol="categoryIndex",
+    featuresCol="selected_features"
+)
+
 pipeline = Pipeline(stages=[
     tokenizer,
     stopwords_remover,
@@ -323,58 +358,62 @@ pipeline = Pipeline(stages=[
     idf,
     normalizer,
     category_indexer,
-    lr
+    chi_selector,
+    ovr
 ])
 
-# Define the parameter grid for grid search
+# 3) Parameter grid: compare top-k selector + SVM hyperparams
 param_grid = ParamGridBuilder() \
-    .addGrid(lr.regParam, [0.01, 0.1, 1.0]) \
-    .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0]) \
-    .addGrid(lr.maxIter, [10, 100]) \
+    .addGrid(chi_selector.numTopFeatures, [500, 2000]) \
+    .addGrid(lsvc.regParam,          [0.01, 0.1, 1.0]) \
+    .addGrid(lsvc.maxIter,           [10, 100]) \
+    .addGrid(lsvc.standardization,    [True, False]) \
     .build()
 
-# Create the evaluator
-evaluator = MulticlassClassificationEvaluator(
-    labelCol="categoryIndex",
-    predictionCol="prediction",
-    metricName="f1"
-)
-
-# Create the cross-validator
 cross_validator = CrossValidator(
     estimator=pipeline,
     estimatorParamMaps=param_grid,
-    evaluator=evaluator,
+    evaluator=MulticlassClassificationEvaluator(
+        labelCol="categoryIndex",
+        predictionCol="prediction",
+        metricName="f1"
+    ),
     numFolds=config['num_folds'],
     seed=config['random_seed']
 )
 
-# Fit the cross-validator
+# 4) Fit, evaluate, save
 cv_model = cross_validator.fit(train_df)
 
-# Make predictions on the validation set
-val_predictions = cv_model.transform(val_df)
+val_pred = cv_model.transform(val_df)
+print(val_pred.columns)
+val_pred.select("categoryIndex", "prediction").show(5)
 
-# Evaluate the model on the validation set
-val_f1 = evaluator.evaluate(val_predictions)
+val_pred.groupBy("prediction").count().show()
+val_pred.groupBy("categoryIndex").count().show()
+
+val_pred.filter(val_pred["prediction"].isNull()).count()
+val_pred.filter(val_pred["categoryIndex"].isNull()).count()
+
+val_f1  = MulticlassClassificationEvaluator(
+    labelCol="categoryIndex", predictionCol="prediction", metricName="f1"
+).evaluate(cv_model.transform(val_df))
 print(f"Validation F1 score: {val_f1}")
 
-# Make predictions on the test set
-test_predictions = cv_model.transform(test_df)
+test_f1 = MulticlassClassificationEvaluator(
+    labelCol="categoryIndex", predictionCol="prediction", metricName="f1"
+).evaluate(cv_model.transform(test_df))
+print(f"Test F1 score:       {test_f1}")
 
-# Evaluate the model on the test set
-test_f1 = evaluator.evaluate(test_predictions)
-print(f"Test F1 score: {test_f1}")
+# 5) Save best model
+output_dir = (
+    config['local_model_output_path']
+    if config['mode']=='local'
+    else config['hdfs_output_dir']
+)
+model_path = os.path.join(output_dir, 'svm_onevsrest_model')
+cv_model.bestModel.write().overwrite().save(model_path)
 
-# Get the best parameters
-best_params = cv_model.bestModel.stages[-1].extractParamMap()
-print("Best parameters:")
-for param, value in best_params.items():
-    print(f"{param.name}: {value}")
-
-# Save model and results
-model_path = os.path.join(output_dir, 'logistic_regression_model')
-cv_model.bestModel.write().overwrite().save(model_path)"""
 
 # Stop the Spark session
 spark.stop() 

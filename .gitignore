@@ -1,5 +1,6 @@
 # Ignore data directory
 data/
+archive_results/
 
 # Ignore output directory
 output/
