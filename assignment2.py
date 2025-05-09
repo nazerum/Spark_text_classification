@@ -14,6 +14,7 @@ from pyspark.ml import Pipeline
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from pyspark.sql import functions as F
 
 # -------------------------------
 # Configuration parameters
@@ -216,7 +217,7 @@ else:
     # Write top terms file
     output_lines_rdd.union(sc.parallelize([merged_dict_line])) \
         .saveAsTextFile(config['hdfs_output_dir'])
-
+'''
 #######################################################################################################################################################################################################################
 
 # -------------------------------
@@ -228,7 +229,11 @@ from pyspark.ml import Pipeline
 
 print("\nPart 2: DataFrame-based Text Processing and Chi-Square Scoring")
 
+
+# temp
+data_path = config['local_data_path'] if config['mode'] == 'local' else config['hdfs_dev_data_path']
 reviews_df = spark.read.json(data_path)
+
 
 # Build pipeline
 tokenizer = RegexTokenizer(
@@ -294,126 +299,125 @@ else:
 
 ###################################################################################################################################################################################################
 
-from pyspark.ml.feature import ChiSqSelector
+# -------------------------------
+# Part 3 (revised): cache & classify
+# -------------------------------
+
+from pyspark.ml.feature import ChiSqSelector, StandardScaler, Normalizer
 from pyspark.ml.classification import LinearSVC, OneVsRest
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.ml import Pipeline
 
-# temp
-data_path = config['local_data_path'] if config['mode'] == 'local' else config['hdfs_dev_data_path']
-reviews_df = spark.read.json(data_path)
+# 1) Precompute TF–IDF features once and cache
+prepared_df = model.transform(reviews_df) \
+                   .select("categoryIndex", "features") \
+                   .cache()
+# force materialization so it stays in memory
+prepared_df.count()
 
-
-# Part 3: Text Classification using SVM
-print("\nPart 3: Text Classification using SVM")
-
-# 1) Split
-train_df, val_df, test_df = reviews_df.randomSplit(
-    [config['train_ratio'],
-     config['val_ratio'],
-     config['test_ratio']],
+# 2) Split into train/val/test on the *feature* DataFrame
+train_df, val_df, test_df = prepared_df.randomSplit(
+    [config['train_ratio'], config['val_ratio'], config['test_ratio']],
     seed=config['random_seed']
 )
+train_val_df = train_df.union(val_df).cache()
+test_df.cache()
 
-print("Train count:", train_df.count())
-print("Val count:", val_df.count())
-print("Test count:", test_df.count())
-
-# 2) Build pipeline with SVM + Chi-Square selector
-tokenizer = Tokenizer(inputCol="reviewText", outputCol="tokens")
-stopwords_remover = StopWordsRemover(
-    inputCol="tokens", outputCol="filtered_tokens", stopWords=list(stopwords)
-)
-hashing_tf = HashingTF(
-    inputCol="filtered_tokens", outputCol="raw_features",
-    numFeatures=config['num_features']
-)
-idf        = IDF(inputCol="raw_features", outputCol="features")
-normalizer = Normalizer(inputCol="features", outputCol="normalized_features", p=2.0)
-category_indexer = StringIndexer(
-    inputCol="category", outputCol="categoryIndex"
-)
-
-# Chi-square selector stage
-chi_selector = ChiSqSelector(
-    numTopFeatures=2000,  
-    featuresCol="raw_features",  
-    outputCol="selected_features",
+# 3) Build *only* the classification pipeline
+selector = ChiSqSelector(
+    featuresCol="features",
+    outputCol="selectedFeatures",
     labelCol="categoryIndex"
 )
-
-# SVM wrapped in one-vs-rest for multi-class
+scaler = StandardScaler(
+    inputCol="selectedFeatures",
+    outputCol="scaledFeatures",
+    withMean=False  # keep sparse
+)
+normalizer = Normalizer(
+    inputCol="scaledFeatures",
+    outputCol="normFeatures",
+    p=2
+)
 lsvc = LinearSVC(
-    featuresCol="selected_features",
+    featuresCol="normFeatures",
     labelCol="categoryIndex"
 )
 ovr = OneVsRest(
     classifier=lsvc,
     labelCol="categoryIndex",
-    featuresCol="selected_features"
+    featuresCol="normFeatures"
 )
 
-pipeline = Pipeline(stages=[
-    tokenizer,
-    stopwords_remover,
-    hashing_tf,
-    idf,
-    normalizer,
-    category_indexer,
-    chi_selector,
-    ovr
-])
+cls_pipeline = Pipeline(stages=[selector, scaler, normalizer, ovr])
 
-# 3) Parameter grid: compare top-k selector + SVM hyperparams
-param_grid = ParamGridBuilder() \
-    .addGrid(chi_selector.numTopFeatures, [500, 2000]) \
-    .addGrid(lsvc.regParam,          [0.01, 0.1, 1.0]) \
-    .addGrid(lsvc.maxIter,           [10, 100]) \
-    .addGrid(lsvc.standardization,    [True, False]) \
+# 4) Hyper-parameter grid (chi2 top K, standardization, regParam, maxIter)
+#    See Assignment 2 Part 3 :contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+paramGrid = (ParamGridBuilder()
+    .addGrid(selector.numTopFeatures, [2000, 500])
+    .addGrid(scaler.withStd, [True, False])
+    .addGrid(lsvc.regParam, [0.01, 0.1, 1.0])
+    .addGrid(lsvc.maxIter, [10, 100])
     .build()
+)
 
-cross_validator = CrossValidator(
-    estimator=pipeline,
-    estimatorParamMaps=param_grid,
-    evaluator=MulticlassClassificationEvaluator(
-        labelCol="categoryIndex",
-        predictionCol="prediction",
-        metricName="f1"
-    ),
-    numFolds=config['num_folds'],
+evaluator = MulticlassClassificationEvaluator(
+    labelCol="categoryIndex",
+    predictionCol="prediction",
+    metricName="f1"
+)
+
+# 5) TrainValidationSplit *on the cached feature DataFrame*
+
+# this is to figure out best parallelisation parameter
+if config["mode"] == "local":
+    parallelism = 1
+else:
+    executor_infos = sc._jsc.sc().statusTracker().getExecutorInfos()
+    active_executors = [
+        e.host()
+        for e in executor_infos
+        if "driver" not in str(e)  # Skip the driver
+    ]
+    num_executors = len(active_executors)
+    executor_cores = int(sc.getConf().get("spark.executor.cores", "1"))
+    parallelism = min(len(paramGrid), num_executors * executor_cores)
+
+
+tvs = TrainValidationSplit(
+    estimator=cls_pipeline,
+    estimatorParamMaps=paramGrid,
+    evaluator=evaluator,
+    # only classify, so split ratio is train/(train+val)
+    trainRatio=config['train_ratio'] / (config['train_ratio'] + config['val_ratio']),
+    parallelism=parallelism,                     # <— lower to avoid local OOM/worker crashes
     seed=config['random_seed']
 )
 
-# 4) Fit, evaluate, save
-cv_model = cross_validator.fit(train_df)
+# Fit on train+val
+tvsModel = tvs.fit(train_val_df)
 
-val_pred = cv_model.transform(val_df)
-print(val_pred.columns)
-val_pred.select("categoryIndex", "prediction").show(5)
+# 6) Evaluate on the held‐out test set
+predictions = tvsModel.transform(test_df)
+f1 = evaluator.evaluate(predictions)
+print(f"Test F1 score: {f1:.4f}")
 
-val_pred.groupBy("prediction").count().show()
-val_pred.groupBy("categoryIndex").count().show()
+# 7) (Optional) persist best model
+if config['mode']=='local':
+    tvsModel.bestModel.write().overwrite().save(config['local_model_output_path'])
+else:
+    tvsModel.bestModel.write().overwrite().save(os.path.join(config['hdfs_output_dir'], "best_model"))
 
-val_pred.filter(val_pred["prediction"].isNull()).count()
-val_pred.filter(val_pred["categoryIndex"].isNull()).count()
+# 8) Inspect best params
+sel_m    = tvsModel.bestModel.stages[0]
+scaler_m = tvsModel.bestModel.stages[1]
+best_svm = tvsModel.bestModel.stages[-1].getClassifier()
 
-val_f1  = MulticlassClassificationEvaluator(
-    labelCol="categoryIndex", predictionCol="prediction", metricName="f1"
-).evaluate(cv_model.transform(val_df))
-print(f"Validation F1 score: {val_f1}")
+print("Best hyper‐parameters:")
+print(f"  numTopFeatures = {sel_m.getNumTopFeatures()}")
+print(f"  withStd        = {scaler_m.getOrDefault('withStd')}")
+print(f"  regParam       = {best_svm.getRegParam()}")
+print(f"  maxIter        = {best_svm.getMaxIter()}")
 
-test_f1 = MulticlassClassificationEvaluator(
-    labelCol="categoryIndex", predictionCol="prediction", metricName="f1"
-).evaluate(cv_model.transform(test_df))
-print(f"Test F1 score:       {test_f1}")
-
-# 5) Save best model
-output_dir = (
-    config['local_model_output_path']
-    if config['mode']=='local'
-    else config['hdfs_output_dir']
-)
-model_path = os.path.join(output_dir, 'svm_onevsrest_model')
-cv_model.bestModel.write().overwrite().save(model_path)
-
-
-# Stop the Spark session
-spark.stop() 
+spark.stop()
